@@ -1,0 +1,14 @@
+# gc-registry — local pack store + discovery surface for gc import.
+#
+# Status: design only. The implementation is in progress.
+# Six planned verbs: list, info, add, remove, search, rebuild.
+# See README.md for the user guide and docs/design.md for the full design.
+#
+# This pack.toml will declare [[commands]] entries once the implementation
+# lands. For now it's a placeholder so the directory is recognized as a pack.
+
+[pack]
+name = "registry"
+version = "0.0.1"
+schema = 1
+description = "Local pack store + discovery surface for gc import (design only — not yet implemented)"
