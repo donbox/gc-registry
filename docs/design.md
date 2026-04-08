@@ -67,7 +67,7 @@ The session that produced this doc closed several questions. Recording them here
 | Wire format for internet registry protocol? | **TOML.** | Self-consistency with the rest of Gas City — same syntax our local files use, same parser, same mental model. Costs us `jq` ergonomics; gains us "one format end-to-end." Use the registered media type `application/toml`. |
 | Conflict policy for two URLs claiming the same `[pack].name`? | **`gc registry add --name <alias>`** to disambiguate. Refuse the second add otherwise. | Same shape as `gc rig add` and `gc city register` — when a default name collides, the user supplies one explicitly. |
 | Implicit imports list — registry-driven or hardcoded? | **Hardcoded in `gc-import` for v1.** A future "stdlib" feature could let the registry publish the implicit list, but v1 keeps it as a literal in the package manager source. See "How the implicit-imports feature intersects with the registry" below. | The implicit list is currently exactly one entry (`maintenance`); not worth a registry round-trip. |
-| One canonical registry, or many? | **v1: one canonical PR-managed registry. v1.5: `gc registry config add/remove/list` verbs to manage additional internal registries.** | Curation, operational simplicity, and "one place to find packs" (Chris Sells's argument) are the v1 wins. The day a team needs a private internal registry, v1.5 ships verbs to manage them. See "The canonical registry and adding packs to it" below. |
+| Where do users go to find packs? | **One canonical PR-managed registry**, hosted as a git repo. Updates are pull requests against that repo. | Curation, operational simplicity, and "one place to find packs." See "The canonical registry and adding packs to it" below. |
 
 
 
@@ -138,7 +138,7 @@ Five verbs, mirroring `gc import` in spirit (though they don't have to be the sa
 | `gc registry info <name>` | Show metadata for a name: URL, available versions, description, dependencies, last update | No (local) / Yes (with `--remote`) |
 | `gc registry add <url> [--version <constraint>] [--name <alias>]` | Fetch a URL into the local registry without importing it into any city. Pre-warming. | Yes |
 | `gc registry remove <name>[@<version>]` | Evict a name (or a specific version) from the local registry | No |
-| `gc registry search <query>` | Search descriptions/tags across configured internet registries. `--local` restricts to what's already cached. | Yes by default |
+| `gc registry search <query>` | Search descriptions/tags across the canonical registry. `--local` restricts to what's already cached. | Yes by default |
 
 ### The canonical registry and adding packs to it
 
@@ -157,26 +157,6 @@ The canonical registry never serves pack content. It serves *pointers* — URLs 
 #### How `gc registry search` actually works
 
 `gc registry search <query>` downloads the canonical registry's `registry.toml` over HTTP, filters it locally for the query string, and prints matches. There is no setup: a fresh `gc-import` install knows where the canonical registry lives. Search it, find a pack, copy the URL into `gc import add`. That's the entire story for the common case — every user, every public pack.
-
-#### Private and internal registries — deferred to v1.5
-
-v1 ships with the canonical Gas City registry only. There is no way to add additional registries — internal team registries, private mirrors, alternative public registries — in v1.
-
-**v1.5 adds verbs for managing additional registries:**
-
-```
-gc registry config list                  # show currently configured registries
-gc registry config add <name> <url>      # add an internal/team registry
-gc registry config remove <name>         # remove an added registry (the canonical one cannot be removed)
-```
-
-The internals are designed to make this an additive change rather than a redesign — the v1 code already iterates over a list of registries (it just iterates over a list of one), and v1.5 adds the user-facing API for changing what's in the list.
-
-Why defer:
-
-- v1 is surgical. Adding three new verbs and their docs is real scope to defer.
-- Almost every v1 user, by design, will only need the canonical registry. The verbs would mostly be plumbing nobody uses.
-- The day a real internal team asks for private-registry support, v1.5 ships as a focused follow-on. The design is already here.
 
 > **Open question (intentionally deferred):** what's actually in the canonical registry on day one? Pack, Registry, and some combination of gastown / maintenance / dog are the obvious candidates. The decision lives in the canonical registry repo, not in this design doc — file an issue against `gastownhall/gc-registry-canonical` (or whatever the final name turns out to be) when v1 is closer to shipping.
 
@@ -289,7 +269,7 @@ Eviction errors if any city's `pack.lock` on the same machine references the ver
 
 ### `gc registry search <query>`
 
-Discovery surface. Queries the canonical Gas City registry and prints results. `--local` restricts to what's already in the local pack store. `--from <name>` restricts to a specific registry — meaningful only after v1.5 adds support for additional registries via `gc registry config` (see "Private and internal registries — deferred to v1.5" above).
+Discovery surface. Queries the canonical Gas City registry and prints results. `--local` restricts to what's already in the local pack store.
 
 ```
 $ gc registry search auth
@@ -303,7 +283,7 @@ $ gc registry search auth --from canonical
 gastownhall/dolt-auth   0.3.1   Authentication agents for Dolt-backed cities
 ```
 
-For users who have manually added internal registries, multiple configured registries get queried in parallel; results are unioned. There is no precedence or fallback chain — that's federation, which we're not building. The undocumented multi-registry path exists so that internal/team registries become possible without redesigning the registry concept; see "The canonical registry and adding packs to it" above for the rationale.
+There is one canonical registry. Federation across multiple registries is out of scope for v1.
 
 ## Internet registry protocol
 
@@ -477,18 +457,15 @@ When a name collision happens during a side-effect populate (two cities import p
 - **`gc registry add <url> [--version <c>] [--name <alias>]`** — pre-warm; fetch a URL into the local registry without touching any city
 - **`gc registry remove <name>[@<version>]`** — evict
 - **`gc registry search <query>`** — discovery via configured internet registries (`--local` for offline, `--from <name>` for one specific registry)
-- **Configuration** for internet registries: in v1, there is none. The canonical Gas City registry is the only one, and `gc-import` knows where it lives. v1.5 adds `gc registry config add/remove/list` verbs for managing additional internal registries.
+- **Configuration**: there is exactly one canonical registry. `gc-import` ships knowing where it lives.
 
 The local registry shape: `~/.gc/cache/repos/<hash>/` (clones, existing path, unchanged). No new files anywhere under `~/.gc/`.
 
 ## Phasing
 
-**Phase 1 (this proposal):** Five verbs above, against Shape A architecture (city cache stays). The pack store at `~/.gc/cache/repos/` is **unchanged** from the existing accelerator — no new files in the cache hierarchy, no index file, no schema. `gc-import` is built knowing the canonical registry's URL; users have no configuration to do. `gc registry` commands get implemented as a Gas City pack (`gc-registry`, pure Python, no Go changes). `gc import` v1 keeps its current URL-and-path-only `add` semantics — bare-name resolution is **not** in v1. v1 is single-registry from the user's perspective; v1.5 adds verbs for additional registries.
+**Phase 1 (this proposal):** Five verbs above, against Shape A architecture (city cache stays). The pack store at `~/.gc/cache/repos/` is **unchanged** from the existing accelerator — no new files in the cache hierarchy, no index file, no schema. `gc-import` is built knowing the canonical registry's URL; users have no configuration to do. `gc registry` commands get implemented as a Gas City pack (`gc-registry`, pure Python, no Go changes). `gc import` v1 keeps its current URL-and-path-only `add` semantics — bare-name resolution is **not** in v1.
 
-**Phase 1.5:** Two additions in v1.5:
-
-1. **Bare-name resolution in `gc import add`** (explicit-only mode). `gc import add gastown` works iff `gastown` is in the local registry. Adds a small lookup step before the existing URL flow.
-2. **`gc registry config add/remove/list` verbs** for managing additional internal/team registries. Promotes the v1 single-registry experience to a real multi-registry one with verb-managed configuration. v1.5 adds the user-facing API for adding/removing registries beyond the canonical default.
+**Phase 1.5: Bare-name resolution in `gc import add`** (explicit-only mode). `gc import add gastown` works iff `gastown` is in the local registry. Adds a small lookup step before the existing URL flow.
 
 **Phase 2:** Promote the implicit-imports list from "hardcoded in `gc-import` source" (where v1 ships it) to "registry-published `implicit.toml` from the canonical registry." Lets the implicit list grow beyond the v1 single entry (`maintenance`) without requiring a new `gc-import` release for each addition. Pairs with the canonical-registry content design — what's actually in the list is **owned by Donna, Chris, and Julian as a product-shape decision**, not by either tool's implementer.
 
@@ -523,8 +500,7 @@ These aren't open questions — they're settled, but they're decisions worth bei
 ## Alternatives considered (and rejected)
 
 - **Local registry as a DB instead of TOML + filesystem.** Faster for large catalogs, but adds a binary format dependency and breaks "it's just files." For a registry of dozens or hundreds of packs, TOML + filesystem is fine.
-- **Internet registry as a single canonical service (like npm).** Centralization is exactly what URL-as-identity was meant to avoid. Multiple parallel registries (each a TOML file at a URL) is the right shape *as a mechanism*. **Update:** the v1 *user-facing experience* is single-registry (canonical registry only, no way to add others) — see the canonical-registry section above. Chris Sells argued for going further and removing the multi-registry mechanism entirely; we kept the mechanism in code so v1.5 can add `gc registry config` verbs as a purely additive feature.
-- **Removing the multi-registry mechanism entirely (Chris Sells's proposal).** Chris's case: a single canonical PR-managed registry gives us curation, operational simplicity, and "one place to find packs" — everything good about npm/PyPI/crates.io minus the central-authority pain that comes from those being implementations rather than git repos. The pushback: it makes private/internal registries impossible without forking the design, which matters because Gas City is going to live a lot of its life inside organizations with internal packs. The compromise we landed on: ship the canonical registry as the only default (capturing all of Chris's wins for the common case) but keep the multi-registry code path so that private registries are a documentation change later, not a redesign. ~10 lines of "iterate over a list of one" buys us forward flexibility for free.
+- **Internet registry as a server-side service with auth and uploads (like npm/PyPI/crates.io).** Centralization is exactly what URL-as-identity was meant to avoid, and a hosted service is operational overhead we don't need. The canonical registry is a git repo with a TOML file; updates are PRs. Same model as homebrew-core, MELPA, and a hundred other community-curated registries.
 - **JSON for the wire format.** Conventional for web APIs, but introduces a second format alongside the TOML we use everywhere else. Self-consistency wins.
 - **Implicit fallback for bare-name `gc import add`.** If `gastown` isn't in the local registry, query configured internet registries to resolve the name to a URL, then proceed. Quietly couples builds to internet-registry availability for the *initial* `add`, and creates a new failure mode that's hard to debug (`why did this command hit the network?`). Rejected in favor of explicit-only resolution in v1.5.
 - **Treating cities as registries.** Briefly considered — what if a city *is* a registry, and importing a pack just means "add a reference to the registry's view of it"? Rejected because cities are consumers, not catalogs. The registry concept is meant to *be* a catalog; conflating the two is the same error as taps were.

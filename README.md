@@ -39,7 +39,7 @@ Per [docs/design.md](docs/design.md):
 - **Settled:** internet registries are pure discovery; federation is out of scope for v1; the pack store stays at `~/.gc/cache/repos/` with no new files (no index file, no schema); URLs remain identity for `gc import`; wire format is TOML (`application/toml`, RFC 9618); name collisions are resolved with `--name <alias>`; the user-facing experience is single-canonical-registry only.
 - **Open (still need answers):** what's actually in the canonical registry on day one (probably some combination of Pack, Registry, gastown, maintenance, dog), reverse-reference tracking for `gc registry remove`, default network behavior of `gc registry info`. See "Open questions" in the design doc.
 - **Deferred to later phases:**
-  - **v1.5**: bare-name resolution in `gc import add`, plus `gc registry config add/remove/list` verbs for managing additional internal/team registries (the multi-registry mechanism is in code already; v1.5 just adds the user-facing API for using it).
+  - **v1.5**: bare-name resolution in `gc import add` (explicit-only mode — `gc import add gastown` works iff `gastown` is already in the local registry).
   - **v.next**: Shape C cache collapse (the city's loader reads from the registry directly, no per-city `.gc/cache/packs/`), tied to the Pack/City refactor.
 
 ## The canonical registry
