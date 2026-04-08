@@ -4,15 +4,23 @@
 
 Title: `feat: gc registry — local pack registry with discovery via internet registries`
 
-Companion to [doc-packman.md](doc-packman.md), which defines `gc import` (the package manager that consumes packs by URL). This doc defines `gc registry`: a local store for pack content + a discovery surface for finding packs that aren't already pinned in your imports.
+Companion to [gastownhall/gascity#434](https://github.com/gastownhall/gascity/issues/434) (`gc import`), which defines the package manager that consumes packs by URL. This doc defines `gc registry`: a local store for pack content + a discovery surface for finding packs that aren't already pinned in your imports.
 
 > **Keeping in sync:** This file is the source of truth. Same convention as doc-packman.md.
 
 ---BEGIN ISSUE---
 
+> **This proposal is part of a three-part design** that seeks to:
+>
+> - **Provide clean state separation for cities and packs** (a.k.a., have `city.toml` not do three different jobs) — [gastownhall/gascity#360](https://github.com/gastownhall/gascity/issues/360) (Pack/City v.next).
+> - **Provide a more robust model for importing, identifying, and versioning packages** — [gastownhall/gascity#360](https://github.com/gastownhall/gascity/issues/360) (defines the `[imports]` schema and the city-as-pack refactor) plus [gastownhall/gascity#434](https://github.com/gastownhall/gascity/issues/434) (`gc import`, which implements semver constraints, transitive resolution, and the lock file on top of that schema).
+> - **Provide an initial package management mechanism for both on-machine and internet registries** — [gastownhall/gascity#434](https://github.com/gastownhall/gascity/issues/434) (`gc import`, already filed) and **this issue** (`gc registry`).
+>
+> The three issues are designed to be implementable in sequence. `gc import` (#434) ships first against the v1 schema. `gc registry` (this issue) ships next, paired with `gc import` and exposing the local pack store and discovery surface. Pack/City v.next (#360) lands when the gascity loader gains the small set of capabilities the new schema requires. None of the three blocks the others — but they make more sense read together than in isolation.
+
 ## Problem
 
-`gc import` (per [doc-packman.md](doc-packman.md)) takes a git URL and produces a working pack in a city. That answers the "I know what I want" case. It does **not** answer:
+`gc import` (per [gastownhall/gascity#434](https://github.com/gastownhall/gascity/issues/434)) takes a git URL and produces a working pack in a city. That answers the "I know what I want" case. It does **not** answer:
 
 1. **Discovery** — "what packs exist that I might want?" Today the answer is "ask around in Slack." There is no enumerated catalog of packs and no way to search by purpose, tag, or description.
 2. **Curation** — "I want a vetted standard library of packs (gastown, maintenance, dog, polecat, …) that's available without each user knowing or copy-pasting URLs."
@@ -45,7 +53,7 @@ These are settled and not up for debate in this doc.
 
 **Federation is out of scope for v1.** Single local registry, period. We may add upstream pulls or registry chains in a later version once we've seen what real users actually need. Any design feature that exists *only* to support federation should be deferred.
 
-## Settled decisions
+## Design and scoping decisions
 
 The session that produced this doc closed several questions. Recording them here so we don't relitigate.
 
@@ -54,11 +62,12 @@ The session that produced this doc closed several questions. Recording them here
 | Internet registries at resolve time? | **No.** Discovery only. | Builds must never depend on a remote service being up. |
 | Federation in v1? | **No.** | Premature complexity; revisit when there's demand. |
 | City cache (`.gc/cache/packs/`) goes away? | **No.** It stays. | The loader needs a materialized view per city. The local registry stores clones; the city cache stores materialized packs. They're different shapes for different consumers. |
-| Local registry exposes the existing hidden accelerator? | **Yes, in place.** No directory rename in v1. | The thing currently at `~/.gc/cache/repos/<hash>/` stays put for v1 and is presented to users as "the local registry" via the new `gc registry` commands. Renaming the directory to `~/.gc/registry/` is tied to the Pack/City v.next refactor; we don't make stability promises about the shape of `~/.gc`, so the rename can happen later without ceremony. For v1, the verb is `gc registry list` but the bytes still live under `~/.gc/cache/repos/`. We add a sibling `index.toml` in that directory rather than creating a new directory tree. |
+| Local registry exposes the existing hidden accelerator? | **Yes, in place.** No directory rename, no new files in `~/.gc/cache/repos/`. | The thing currently at `~/.gc/cache/repos/<hash>/` stays put for v1 and is presented to users as "the local registry" via the new `gc registry` commands. Renaming the directory to `~/.gc/registry/` is tied to the Pack/City v.next refactor; we don't make stability promises about the shape of `~/.gc`, so the rename can happen later without ceremony. For v1, the verb is `gc registry list` but the bytes still live under `~/.gc/cache/repos/`. **The cache hierarchy is unchanged from the existing accelerator** — no sibling index file, no metadata, no schema. `gc registry list` walks the clones on demand and reads each one's `pack.toml`. |
 | `gc import` keeps URLs as identity? | **Yes.** | URL-as-identity is what makes the resolver simple. The registry is a layer for discovery and storage, not a name resolver. |
 | Wire format for internet registry protocol? | **TOML.** | Self-consistency with the rest of Gas City — same syntax our local files use, same parser, same mental model. Costs us `jq` ergonomics; gains us "one format end-to-end." Use the registered media type `application/toml`. |
 | Conflict policy for two URLs claiming the same `[pack].name`? | **`gc registry add --name <alias>`** to disambiguate. Refuse the second add otherwise. | Same shape as `gc rig add` and `gc city register` — when a default name collides, the user supplies one explicitly. |
-| Implicit standard library? | **Deferred to v.next, design owned by the registry.** See "Explicit design decision: no implicit imports in v1" below. | Implicit imports re-introduce magic that's hard to debug; v1 ships explicit-only. |
+| Implicit imports list — registry-driven or hardcoded? | **Hardcoded in `gc-import` for v1.** A future "stdlib" feature could let the registry publish the implicit list, but v1 keeps it as a literal in the package manager source. See "How the implicit-imports feature intersects with the registry" below. | The implicit list is currently exactly one entry (`maintenance`); not worth a registry round-trip. |
+| One canonical registry, or many? | **v1: one canonical PR-managed registry. v1.5: `gc registry config add/remove/list` verbs to manage additional internal registries.** | Curation, operational simplicity, and "one place to find packs" (Chris Sells's argument) are the v1 wins. The day a team needs a private internal registry, v1.5 ships verbs to manage them. See "The canonical registry and adding packs to it" below. |
 
 
 
@@ -69,20 +78,18 @@ The session that produced this doc closed several questions. Recording them here
 ├── cache/
 │   └── repos/                      # the local registry's pack store (the existing
 │       │                             "hidden accelerator", now exposed via gc registry)
-│       ├── index.toml              # name → URL → metadata index (built locally)
 │       │                             — this is what gc registry list reads
 │       └── <sha256(url+commit)>/   # one git clone per (URL, commit) pair
 │           ├── .git/
 │           └── ... pack contents ...
 ├── cities.toml                     # existing — gc register's list of registered cities
 ├── taps.toml                       # existing — legacy v1 gc pack tap registry (separate concept)
-└── registry-config.toml            # NEW — internet registry configuration (which ones to query)
 
 <city>/
 ├── city.toml                       # gascity config + [imports] (v1) + machine-managed [packs]/includes (v1)
 ├── pack.toml                       # gc import — direct imports (v2)
 ├── pack.lock                       # gc import — resolved transitive closure
-├── packs/                          # hand-authored sub-packs (and frozen imports — experimental)
+# (no ./packs/ — vendoring is cut for v1; if it comes back it'll be reframed as registry pinning)
 └── .gc/
     └── cache/
         └── packs/                  # materialized packs the loader reads
@@ -93,16 +100,15 @@ The session that produced this doc closed several questions. Recording them here
 
 > **Note on the path.** The registry's pack store lives at `~/.gc/cache/repos/` for v1, **not** `~/.gc/registry/store/`. We don't make stability promises about the shape of `~/.gc`, so the directory rename is tied to the Pack/City v.next refactor and isn't worth doing in v1. The user-facing word is "the local registry" (verbs are `gc registry list`, `gc registry add`, etc.); the bytes still live under `~/.gc/cache/repos/`. When v.next happens, the directory moves and `gc registry` keeps working without ceremony.
 
-The local registry has two layers:
+The local registry is **the existing accelerator, unchanged**. `~/.gc/cache/repos/<hash>/` holds git clones keyed by `sha256(url + commit)`, populated as a side effect of `gc import add` / `upgrade` / `install` (and, new in this design, by `gc registry add`). The cache is a flat directory of hash-named clone roots. No sibling metadata file, no index, no schema. The cache is opaque; users interact with it via `gc registry` commands rather than by inspecting it.
 
-- **`~/.gc/cache/repos/<hash>/`** — the existing accelerator. Git clones keyed by `sha256(url + commit)`. This is the pack content. Populated as a side effect of `gc import add` / `upgrade` / `install`, and (new in this design) by `gc registry add`.
-- **`~/.gc/cache/repos/index.toml`** — a small TOML file the registry manages itself, mapping `name → URL → version-list → commit + hash + metadata`. This is what makes `gc registry list`, `gc registry info`, and `gc registry search --local` possible without crawling every clone in `cache/repos/`.
+`gc registry list` and `gc registry info` compute their output **on demand** by walking `~/.gc/cache/repos/`, opening each clone's `pack.toml`, and reading the name and version. At v1 scale (single-digit to low-tens of cached packs per machine), this is unmeasurably fast. If the cache ever grows to a size where the walk becomes slow, we'll add an index file as an internal performance optimization — not as a public design feature, and not in v1.
 
-The index is **derived state**: it's rebuilt from the contents of `cache/repos/` plus any explicit metadata from `gc registry add` calls. Wiping `index.toml` and running `gc registry rebuild` reconstructs it. There is no existing TOML index in `~/.gc/cache/repos/` today — the accelerator is currently a flat set of clone directories with no metadata, so `gc import` v0.1 (the implementation that already exists) has no opinion about an index. This design adds one.
+**Why no index file in v1.** The earlier draft of this design added a sibling `index.toml` next to the clones to make `gc registry list` O(1) instead of O(n). On reflection, that's premature: at v1 scale the walk is fine, the index would introduce a new write path on every `gc import add` / `upgrade` / `remove`, and an "index out of sync with the actual clones" failure mode would need a `gc registry rebuild` repair verb. All of that is overhead we don't need for the surgical-fixes-near-release v1. The cache hierarchy stays exactly as it is today.
 
 ## The two-cache question
 
-You'll notice the architecture has **two stores**: `~/.gc/registry/store/` (clones) and `<city>/.gc/cache/packs/` (materialized). This is intentional, not an oversight. Each has a different shape and a different consumer:
+You'll notice the architecture has **two stores**: `~/.gc/cache/repos/` (clones) and `<city>/.gc/cache/packs/` (materialized). This is intentional, not an oversight. Each has a different shape and a different consumer:
 
 | Store | Keyed by | Format | Consumer |
 |---|---|---|---|
@@ -124,7 +130,7 @@ Could the two stores be collapsed into one? Two options on the table, one settle
 
 ## `gc registry` commands (v1 surface)
 
-Six verbs, mirroring `gc import` in spirit (though they don't have to be the same six). Phase-1 surface:
+Five verbs, mirroring `gc import` in spirit (though they don't have to be the same five). Phase-1 surface:
 
 | Command | What it does | Network? |
 |---|---|---|
@@ -133,26 +139,46 @@ Six verbs, mirroring `gc import` in spirit (though they don't have to be the sam
 | `gc registry add <url> [--version <constraint>] [--name <alias>]` | Fetch a URL into the local registry without importing it into any city. Pre-warming. | Yes |
 | `gc registry remove <name>[@<version>]` | Evict a name (or a specific version) from the local registry | No |
 | `gc registry search <query>` | Search descriptions/tags across configured internet registries. `--local` restricts to what's already cached. | Yes by default |
-| `gc registry rebuild` | Rebuild `index.toml` from the contents of `~/.gc/cache/repos/`. Repair operation. | No |
 
-### How `gc registry search` actually works
+### The canonical registry and adding packs to it
 
-`gc registry search <query>` queries the **internet registries configured in `~/.gc/registry-config.toml`**. Each configured registry is a base URL pointing at a server (or a static-hosted directory) that serves the [internet registry protocol](#internet-registry-protocol) — a small set of TOML files at well-known paths. The client downloads `<base>/index.toml` from each configured registry, unions the results, and prints matches.
+There is **one canonical Gas City registry**, hosted as a git repository under the `gastownhall` GitHub organization (working name: `gastownhall/gc-registry-canonical`; final name and location TBD). It is the registry every `gc-import` install talks to by default, and it is the registry every user-facing piece of documentation refers to when it says "the registry."
 
-```toml
-# ~/.gc/registry-config.toml — managed by gc registry config or hand-edited
-[[registries]]
-name = "gascity-stdlib"
-url = "https://raw.githubusercontent.com/gascity/registry-stdlib/main/"
+The canonical registry is **a git repo containing a single `registry.toml` file** at its root, plus per-pack metadata files under `packs/`. That's it — no server, no CDN, no auth, no upload pipeline. The repo is served via `https://raw.githubusercontent.com/gastownhall/gc-registry-canonical/main/` for HTTP fetches; `gc registry search` and `gc registry info` read directly from those URLs using the internet registry protocol described later in this doc.
 
-[[registries]]
-name = "myteam-internal"
-url = "https://internal.example.com/gc-registry/"
+#### How packs get added
+
+**File a PR against the canonical registry repo.** The PR adds (or updates) one entry in `registry.toml` plus an optional `packs/<name>.toml` file with richer metadata. Reviewers merge after a quick check that the URL is reachable, the pack has at least one semver tag, and the description isn't actively misleading. There is no automated scanning, no signing, no provenance verification — the PR review is the curation step, and the merge is the publish event.
+
+This is the same model as homebrew-core, MELPA, and a hundred other community-curated registries: the curation is the review, and review effort scales with submission volume. For an ecosystem the size of Gas City's, that's the right shape.
+
+The canonical registry never serves pack content. It serves *pointers* — URLs into the actual pack repos. Adding a pack to the canonical registry doesn't move bytes anywhere; it just tells the registry "this name maps to this URL." The URL still has to be a git repo that `gc import` can clone, the same as any other URL.
+
+#### How `gc registry search` actually works
+
+`gc registry search <query>` downloads the canonical registry's `registry.toml` over HTTP, filters it locally for the query string, and prints matches. There is no setup: a fresh `gc-import` install knows where the canonical registry lives. Search it, find a pack, copy the URL into `gc import add`. That's the entire story for the common case — every user, every public pack.
+
+#### Private and internal registries — deferred to v1.5
+
+v1 ships with the canonical Gas City registry only. There is no way to add additional registries — internal team registries, private mirrors, alternative public registries — in v1.
+
+**v1.5 adds verbs for managing additional registries:**
+
+```
+gc registry config list                  # show currently configured registries
+gc registry config add <name> <url>      # add an internal/team registry
+gc registry config remove <name>         # remove an added registry (the canonical one cannot be removed)
 ```
 
-A fresh install ships with **one default registry** pre-configured (the gascity-stdlib registry) so `gc registry search` works out of the box without any setup. Users can add more with `gc registry config add <name> <url>` or remove the default with `gc registry config remove gascity-stdlib`. There is no precedence chain among multiple configured registries — results are unioned and the user disambiguates with `--from <name>` if needed. (That's not federation; it's parallel discovery.)
+The internals are designed to make this an additive change rather than a redesign — the v1 code already iterates over a list of registries (it just iterates over a list of one), and v1.5 adds the user-facing API for changing what's in the list.
 
-> **Open question (intentionally deferred):** what's actually in the gascity-stdlib registry on day one, and where does it live? Pack, Registry, and some combination of gastown / maintenance / dog are the obvious candidates. The decision lives in the registry-stdlib project, not in this design doc — file an issue against gastownhall/registry-stdlib (or wherever the stdlib repo ends up) when v1 is closer to shipping.
+Why defer:
+
+- v1 is surgical. Adding three new verbs and their docs is real scope to defer.
+- Almost every v1 user, by design, will only need the canonical registry. The verbs would mostly be plumbing nobody uses.
+- The day a real internal team asks for private-registry support, v1.5 ships as a focused follow-on. The design is already here.
+
+> **Open question (intentionally deferred):** what's actually in the canonical registry on day one? Pack, Registry, and some combination of gastown / maintenance / dog are the obvious candidates. The decision lives in the canonical registry repo, not in this design doc — file an issue against `gastownhall/gc-registry-canonical` (or whatever the final name turns out to be) when v1 is closer to shipping.
 
 ### `gc registry list`
 
@@ -164,7 +190,7 @@ polecat      0.4.1                 https://github.com/example/polecat
 maintenance  2.0.1                 https://github.com/example/maintenance
 ```
 
-Reads `index.toml`, prints one row per name with the versions currently available locally. The "SOURCE" column shows the canonical URL the registry recorded for this name.
+Walks `~/.gc/cache/repos/`, opens each clone's `pack.toml` to read its name and version, and prints one row per pack. No index file is consulted; the cache directory is the source of truth. The "SOURCE" column shows the URL the clone was fetched from (encoded in the hash).
 
 ### `gc registry info <name>`
 
@@ -192,7 +218,7 @@ Local mode reads the registry index and the cached `pack.toml` files. Remote mod
 
 ### `gc registry add <url> [--version <constraint>] [--name <alias>]`
 
-The "pre-warm the registry without touching any city" command. Fetches a URL into `~/.gc/cache/repos/`, parses the resolved pack's `pack.toml` for name + version, and updates `index.toml`.
+The "pre-warm the registry without touching any city" command. Fetches a URL into `~/.gc/cache/repos/`, parses the resolved pack's `pack.toml` for name + version, and the next `gc registry list` will pick it up automatically (no index file to update — the cache directory is the source of truth).
 
 **`--version` works exactly like `gc import add --version`.** Same constraint syntax (`^1.2`, `~1.2.3`, `>=1.0,<2.0`, exact `1.2.3`). If `--version` is omitted, the default is `^<major>.<minor>` of the highest available tag — same default as `gc import add`. The point of the symmetry: a user who learns one verb has learned both.
 
@@ -236,8 +262,8 @@ Useful for:
 
 Both commands **read through the registry as their store layer and populate it as a side effect**. This is the same behavior the existing `gc import` v0.1 already has — the rename from "hidden accelerator" to "local registry" doesn't change anything about how the bytes flow:
 
-- `gc import install` reads `pack.lock`, looks up each `(URL, commit)` pair in the registry (`~/.gc/cache/repos/<sha256(url+commit)>/`), and **clones-on-miss**. The clone-on-miss writes a new entry to `index.toml`. So `install` IS a read-through cache update, and a `gc registry list` immediately after a fresh `install` will show every pack the install just pulled in.
-- `gc import upgrade` is the same flow with new commits chosen by re-resolving constraints. New commits → new hash directories in `cache/repos/` → new `index.toml` entries.
+- `gc import install` reads `pack.lock`, looks up each `(URL, commit)` pair in the registry (`~/.gc/cache/repos/<sha256(url+commit)>/`), and **clones-on-miss**. New clone directories appear in the cache as a side effect, so a `gc registry list` immediately after a fresh `install` will show every pack the install just pulled in (the walk picks them up automatically).
+- `gc import upgrade` is the same flow with new commits chosen by re-resolving constraints. New commits → new hash directories in `cache/repos/`.
 - Neither command requires `gc registry add` first. The registry is populated lazily by import operations; explicit `gc registry add` is only useful for pre-warming (CI / offline / curation).
 
 **The index entry's name** comes from the resolved pack's `[pack].name` (read from `pack.toml` inside the clone), **not** from the local handle the importing city uses. Two cities can call the same pack `gastown` and `gtwn` respectively in their local `[imports]` blocks; both refer to the same registry entry whose name is `gastown` (the upstream's self-declared name). This is consistent: the registry is shared across cities; using a local handle as the index key would mean each city sees its own private registry view, which is not what we want.
@@ -263,7 +289,7 @@ Eviction errors if any city's `pack.lock` on the same machine references the ver
 
 ### `gc registry search <query>`
 
-Discovery surface. By default queries every internet registry configured in `~/.gc/registry-config.toml` and prints results. `--local` restricts to what's already in the local pack store. `--from <name>` restricts to a single configured registry.
+Discovery surface. Queries the canonical Gas City registry and prints results. `--local` restricts to what's already in the local pack store. `--from <name>` restricts to a specific registry — meaningful only after v1.5 adds support for additional registries via `gc registry config` (see "Private and internal registries — deferred to v1.5" above).
 
 ```
 $ gc registry search auth
@@ -273,58 +299,98 @@ example/oauth-broker    1.2.0   OAuth2 broker pack with token caching
 $ gc registry search auth --local
 (no local matches)
 
-$ gc registry search auth --from gascity-stdlib
+$ gc registry search auth --from canonical
 gastownhall/dolt-auth   0.3.1   Authentication agents for Dolt-backed cities
 ```
 
-Multiple configured registries get queried in parallel; results are unioned. There is no precedence or fallback chain — that's federation, which we're not building. See [How `gc registry search` actually works](#how-gc-registry-search-actually-works) above for the configuration details.
-
-### `gc registry rebuild`
-
-Repair operation. Walks `~/.gc/cache/repos/`, parses each clone's `pack.toml`, and rewrites `index.toml`. Useful if the index gets corrupted or out of sync, or after a manual `rm -rf` of an entry.
+For users who have manually added internal registries, multiple configured registries get queried in parallel; results are unioned. There is no precedence or fallback chain — that's federation, which we're not building. The undocumented multi-registry path exists so that internal/team registries become possible without redesigning the registry concept; see "The canonical registry and adding packs to it" above for the rationale.
 
 ## Internet registry protocol
 
 An internet registry is **any HTTP endpoint that speaks a small TOML protocol.** No central server, no required authentication, no upload pipeline. A registry can be as simple as a static TOML file served from S3 or a GitHub Pages site.
 
-**Why TOML and not JSON?** Self-consistency. Every other file in Gas City is TOML — `city.toml`, `pack.toml`, `pack.lock`, `imports.toml` (when v1 had it), `~/.gc/cache/repos/index.toml`. Using JSON for the wire format would introduce a second format with no benefit other than `jq` ergonomics. Same parser, same syntax, end to end. We use the registered media type `application/toml` (RFC 9618) for the responses; clients can also accept `text/x-toml` from servers that haven't been updated.
+**Why TOML and not JSON?** Self-consistency. Every other file in Gas City is TOML — `city.toml`, `pack.toml`, `pack.lock`, `~/.gc/implicit-import.toml`. Using JSON for the wire format would introduce a second format with no benefit other than `jq` ergonomics. Same parser, same syntax, end to end. We use the registered media type `application/toml` (RFC 9618) for the responses; clients can also accept `text/x-toml` from servers that haven't been updated.
 
 The protocol has three endpoints:
 
-- **`GET /index.toml`** — lists every pack in the registry with name, latest version, description, tags. Used by `gc registry search` to populate results.
-- **`GET /packs/<name>.toml`** — full metadata for a name: URL, all versions, descriptions per version, dependencies. Used by `gc registry info --remote --from <registry>`.
-- **`GET /search?q=<query>`** *(optional)* — server-side search; returns the same shape as `index.toml` but filtered. If absent, the client downloads `/index.toml` and filters locally.
+- **`GET /registry.toml`** — lists every pack the registry knows about, with name, URL, latest version, description, tags. Used by `gc registry search` to populate results.
+- **`GET /packs/<name>.toml`** — richer metadata for a single pack: all versions, per-version descriptions, dependencies, maintainer info. Used by `gc registry info --remote --from <registry>`. Optional in v1; falling back to `git ls-remote --tags <url>` is acceptable for clients that don't want a second round trip.
+- **`GET /search?q=<query>`** *(optional)* — server-side search; returns the same shape as `registry.toml` but filtered. If absent, the client downloads `/registry.toml` and filters locally.
 
 That's it. Three endpoints, all read-only, all serving static-ish TOML. A registry is "the URL of an HTTP server that serves these endpoints." Static hosting works. CDNs work. A git repo with a TOML file at HEAD and `https://raw.githubusercontent.com/...` works.
 
+#### Schema for `registry.toml`
+
 ```toml
-# Example: index.toml served from a static-hosted internet registry
+# registry.toml — wire format for the internet registry protocol
 
-schema = 1
-name = "gascity-stdlib"
-description = "Curated standard packs for Gas City"
+# Top-level fields. Required unless marked optional.
+schema = 1                              # integer; current version is 1; bump for breaking changes
+name = "canonical"                      # short identifier for this registry; used in --from <name>
+description = "Canonical Gas City pack registry"   # human-readable
+updated = "2026-04-08T00:00:00Z"        # optional; RFC 3339 timestamp of last edit; informational
 
+# Repeated [[packs]] tables. One per pack the registry knows about.
 [[packs]]
-name = "gastown"
-url = "https://github.com/example/gastown"
-latest = "1.6.0"
-description = "Multi-agent orchestration pack with mayor and polecat agents"
-tags = ["orchestration", "stdlib"]
+name = "gastown"                        # required; the pack's [pack].name from its own pack.toml
+url = "https://github.com/example/gastown"   # required; git-cloneable URL (with optional subpath for monorepos)
+latest = "1.6.0"                        # required; the highest semver tag the registry knows about
+description = "Multi-agent orchestration pack with mayor and polecat agents"   # optional; one-line summary
+tags = ["orchestration", "stdlib"]      # optional; array of strings; used for filtering by gc registry search
+maintainer = "gastown-team"             # optional; informational; not validated
+homepage = "https://gastown.example.com" # optional; informational
 
 [[packs]]
 name = "maintenance"
-url = "https://github.com/example/maintenance"
-latest = "2.0.1"
-description = "Infrastructure maintenance agents"
-tags = ["maintenance", "stdlib"]
+url = "https://github.com/gastownhall/maintenance"
+latest = "1.5.0"
+description = "Baseline maintenance and supervision agents (default implicit import)"
+tags = ["infrastructure"]
 
 [[packs]]
 name = "dog"
 url = "https://github.com/example/dog"
 latest = "0.7.2"
-description = "Watchdog and supervision agents"
-tags = ["maintenance", "stdlib"]
+description = "Watchdog and process supervision agents"
+tags = ["infrastructure"]
 ```
+
+**Schema rules:**
+
+- `schema = 1` is the only valid value in v1. Clients SHOULD warn (not error) on unknown schema versions, displaying as much as they can interpret.
+- `name`, `url`, and `latest` on each `[[packs]]` entry are **required**. Clients MUST skip entries missing any of these and SHOULD warn.
+- Unknown top-level fields and unknown fields inside `[[packs]]` are **ignored** without warning. This lets registries add metadata fields ahead of clients adopting them, and lets clients survive registry-side innovation without breaking.
+- Tag strings have no controlled vocabulary in v1. The canonical registry may publish a tag-vocabulary convention later; for v1, tags are freeform and meant for substring search.
+- `name` collisions across `[[packs]]` entries within a single `registry.toml` are an error and the registry's responsibility to prevent at PR-review time.
+
+**Schema for `packs/<name>.toml` (optional richer metadata):**
+
+```toml
+schema = 1
+name = "gastown"
+url = "https://github.com/example/gastown"
+
+# All versions the registry knows about, newest first. The registry
+# is allowed to lag the upstream repo's tag list — clients should
+# treat this as "the registry's best guess" and fall back to
+# git ls-remote --tags <url> when they need authoritative data.
+[[versions]]
+version = "1.6.0"
+released = "2026-03-15T00:00:00Z"   # optional; RFC 3339
+description = "Adds polecat support."   # optional; per-version notes
+deprecated = false                       # optional; default false
+
+[[versions]]
+version = "1.5.0"
+released = "2026-02-01T00:00:00Z"
+
+[[versions]]
+version = "1.4.0"
+released = "2026-01-10T00:00:00Z"
+deprecated = true                        # optional; informational only — clients still resolve it
+```
+
+The `packs/<name>.toml` files are an optimization; in v1 they're optional and the canonical registry may not ship them initially. Clients that need version metadata should either fall back to `git ls-remote` or display "(no extended metadata)" in `gc registry info --remote`.
 
 Critically: **the TOML the registry returns contains URLs**. When `gc registry search` finds gastown, the result is "gastown is at `https://github.com/example/gastown`". The user copies that URL into `gc import add` (no bare-name resolution in v1). The registry never serves pack content. It serves *pointers* to pack content.
 
@@ -334,7 +400,7 @@ This means:
 - Registries are impossible to "lose your packs" — the canonical content lives in git repos, not the registry.
 - Registries don't need versioning, releases, or pipelines. They're descriptions, not packages.
 
-A v1 internet registry will ship as a curated TOML file in a git repo: `https://github.com/gascity/registry-stdlib/blob/main/index.toml`. Pre-configured in `~/.gc/registry-config.toml` on first run via `https://raw.githubusercontent.com/gascity/registry-stdlib/main/`. Future iterations could add a real search service, but the v1 design works without one.
+The v1 canonical registry is a curated `registry.toml` in a git repo: `https://github.com/gastownhall/gc-registry-canonical/blob/main/registry.toml` (working name; final location TBD). `gc-import` is built knowing where this registry lives — there is no user-side configuration needed. The canonical registry is PR-managed: contributors file pull requests against the repo to add or update entries, reviewers merge after a quick sanity check, and the merge is the publish event. No upload pipeline, no auth, no signing — just git. Future iterations could add a real search service, but the v1 design works without one.
 
 ## Relationship to `gc import`
 
@@ -344,7 +410,7 @@ The package manager and the registry are designed in tandem; this section spells
 
 In the URL-only world we built for `gc import` v0.1, the answer was "no — `add` takes a URL or a path, never a bare name." Names had nowhere to be resolved.
 
-With a local registry, names *do* have somewhere to be resolved. `gc import add gastown` could look up `gastown` in `~/.gc/cache/repos/index.toml`, find the URL, and pass it to the existing `gc import add <url>` flow.
+With a local registry, names *do* have somewhere to be resolved. `gc import add gastown` could walk `~/.gc/cache/repos/`, look for a clone whose `pack.toml` declares `name = "gastown"`, read the URL from there, and pass it to the existing `gc import add <url>` flow.
 
 **v1 of `gc import` does NOT support bare-name resolution.** The package manager stays URL-and-path only. Bare-name resolution is **explicitly deferred to phase 1.5**, after both `gc import` v1 and `gc registry` v1 ship. Reasons:
 
@@ -354,22 +420,49 @@ With a local registry, names *do* have somewhere to be resolved. `gc import add 
 
 In v1.5, when bare-name resolution lands, it will be **explicit-only**: `gc import add gastown` errors if `gastown` isn't already in the local registry. The user's recovery is `gc registry add gastown` first (or use the URL form). No silent hits to the network during `add`.
 
-### Implicit imports / standard library — separate phase, registry-owned
+### How the implicit-imports feature intersects with the registry
 
-There's a related idea: **let every city implicitly import a small standard library of packs** — probably some combination of Pack, Registry itself, and a curated set of agent packs (gastown, maintenance, dog) — unless the city opts out via `nostdlib = true` in `pack.toml`. This is genuinely powerful (extends the product surface area without touching every city) but it has consequences:
+`gc import` v1 ships with a small, hardcoded list of **implicit imports** — packs that every city imports automatically unless it opts out via `implicit_imports = false`. **The v1 list contains exactly one entry: `maintenance`.** See the `gc import` design ([gastownhall/gascity#434](https://github.com/gastownhall/gascity/issues/434)) for the full mechanics — opt-out, override-by-explicit-import, lock-file representation (`parent = "(implicit)"`), etc.
 
-1. **The stdlib needs to live somewhere** — almost certainly as a manifest in the default internet registry, applied automatically by the resolver.
-2. **It re-introduces magic** that's hard to debug ("why is `polecat.scout` available in my city? I never imported it." "It's in the stdlib.").
-3. **It couples the package manager to the registry in a load-bearing way** — every city's dependency closure includes registry-managed implicit imports.
-4. **`nostdlib = true` is the escape hatch**, but it has to be honored consistently across transitive imports.
+The interesting question for *this* doc: **where does the implicit list live, and how does it intersect with the registry?**
 
-**Implicit stdlib is deferred to a separate phase** that pairs registry work with package-manager work. It's not part of v1 of either project. It's filed here as the right home for the discussion; the registry doc owns the design when we're ready to do it. **Open call-out for Donna, Chris, and Julian:** the existence of an implicit stdlib (and which packs go in it) is a product-shape decision that needs all three of you. Filing a v.next issue is the right next step.
+**v1: hardcoded in `gc-import`.** A literal in the package manager source. The maintenance pack lives at a known URL; that URL is baked into the resolver. Changing the list means changing the code and shipping a new `gc-import`. This is the simplest possible model and it's appropriate for a list of size one. **The registry plays no role in v1 implicit imports.**
+
+**v.next (probably): registry-published implicit list.** Once the registry has been used in anger for a while, the implicit list could be promoted from "literal in source" to "manifest in the default internet registry." The default registry would publish something like:
+
+```toml
+# implicit.toml — served from the default internet registry alongside registry.toml
+[[implicit]]
+name = "maintenance"
+url = "https://github.com/gastownhall/maintenance"
+version = "^1.5"
+```
+
+`gc import add` / `install` would fetch this manifest from the configured default registry, merge it with the user's `[imports]`, and resolve the union. Same opt-out (`implicit_imports = false`); same lock-file representation; same override-by-explicit-import behavior. The change is purely *where* the list comes from.
+
+**Why defer the registry-published version.** Two reasons:
+
+1. **The list is currently size 1.** A registry round-trip is overkill for one URL we ship in code. Until the list grows past 2–3 entries, hardcoded is fine.
+2. **It would couple `gc import` to a specific internet registry being reachable.** Today, `gc import` only talks to git URLs at resolve time. If the implicit list comes from `https://registry.gascity.dev/implicit.toml`, then every `gc import add` has a new failure mode ("can't reach the implicit-list registry"). The whole point of the registry being purely additive — never load-bearing for builds — gets undermined the minute the implicit list lives there.
+
+   The mitigation is a stale-cache fallback: cache `implicit.toml` locally and only re-fetch on a successful `gc registry update`. But that's complexity we don't need to take on while the list is one entry. **Decision for v1: hardcoded; revisit when the list grows.**
+
+**Open question for v.next:** *if* we move the implicit list to the registry, does it live in the **default** registry only, or can multiple configured registries each contribute? My lean: default only, single source, never federated. A config that lets multiple registries inject packs into every city is the kind of magic users will hate. **File against the registry repo when v.next thinking starts.**
+
+### Implicit standard library beyond `maintenance`
+
+The **bigger** version of "implicit imports" — a curated standard library with multiple agent packs (gastown, dog, polecat, etc.) implicitly imported into every city — is a different conversation. It's deferred for two distinct reasons:
+
+1. **The product question.** "What goes in the stdlib?" is a product-shape decision that needs Donna, Chris, and Julian. v1 has one answer (`maintenance`); the bigger answer is theirs to make.
+2. **The mechanics.** Once the stdlib is more than one entry, the registry-published-list mechanism (above) starts paying for itself. Until then, it's overkill.
+
+**This is filed here as the right home for the discussion**; the registry doc owns the design when we're ready to do it. The shape will probably be: a `[[implicit]]` array in the default registry's `implicit.toml`, with the same opt-out and override semantics as v1's hardcoded version.
 
 ### `gc import install` and `gc import upgrade` — read-through with side-effect populate
 
 Both commands **read through the registry as their store layer and populate it as a side effect.** This is identical to the behavior `gc import` v0.1 already has — the rename from "hidden accelerator" to "local registry" doesn't change anything about how the bytes flow:
 
-- `gc import install` reads `pack.lock`, looks up each `(URL, commit)` pair in the registry, clones-on-miss, materializes into the city cache, verifies the hash. The clone-on-miss writes a new entry to `index.toml`, so a `gc registry list` immediately after a fresh `install` shows every pack the install just pulled in.
+- `gc import install` reads `pack.lock`, looks up each `(URL, commit)` pair in the registry, clones-on-miss, materializes into the city cache, verifies the hash. The new clone directories appear under `~/.gc/cache/repos/` as a side effect, so a `gc registry list` immediately after a fresh `install` shows every pack the install just pulled in (the on-demand walk picks them up automatically).
 - `gc import upgrade` is the same flow with new commits chosen by re-resolving constraints.
 - Neither command requires `gc registry add` first.
 
@@ -384,18 +477,20 @@ When a name collision happens during a side-effect populate (two cities import p
 - **`gc registry add <url> [--version <c>] [--name <alias>]`** — pre-warm; fetch a URL into the local registry without touching any city
 - **`gc registry remove <name>[@<version>]`** — evict
 - **`gc registry search <query>`** — discovery via configured internet registries (`--local` for offline, `--from <name>` for one specific registry)
-- **`gc registry rebuild`** — repair `index.toml`
-- **Configuration** for internet registries lives in `~/.gc/registry-config.toml`. v1 supports hand-editing this file directly. A `gc registry config add <name> <url>` sub-verb is on the v1.5 list if hand-editing turns out to be a friction point.
+- **Configuration** for internet registries: in v1, there is none. The canonical Gas City registry is the only one, and `gc-import` knows where it lives. v1.5 adds `gc registry config add/remove/list` verbs for managing additional internal registries.
 
-The local registry shape: `~/.gc/cache/repos/<hash>/` (clones, existing path) + `~/.gc/cache/repos/index.toml` (derived metadata, new) + `~/.gc/registry-config.toml` (user config for internet registries, new).
+The local registry shape: `~/.gc/cache/repos/<hash>/` (clones, existing path, unchanged). No new files anywhere under `~/.gc/`.
 
 ## Phasing
 
-**Phase 1 (this proposal):** Six verbs above, against Shape A architecture (city cache stays). The pack store stays at `~/.gc/cache/repos/` (existing path); a sibling `index.toml` gets added there; `~/.gc/registry-config.toml` is new. `gc registry` commands get implemented as a Gas City pack (`gc-registry`, pure Python, no Go changes). `gc import` v1 keeps its current URL-and-path-only `add` semantics — bare-name resolution is **not** in v1. Internet registry support ships with one default-configured registry (`gascity-stdlib`) on first run.
+**Phase 1 (this proposal):** Five verbs above, against Shape A architecture (city cache stays). The pack store at `~/.gc/cache/repos/` is **unchanged** from the existing accelerator — no new files in the cache hierarchy, no index file, no schema. `gc-import` is built knowing the canonical registry's URL; users have no configuration to do. `gc registry` commands get implemented as a Gas City pack (`gc-registry`, pure Python, no Go changes). `gc import` v1 keeps its current URL-and-path-only `add` semantics — bare-name resolution is **not** in v1. v1 is single-registry from the user's perspective; v1.5 adds verbs for additional registries.
 
-**Phase 1.5:** Bare-name resolution in `gc import add` (explicit-only mode). `gc import add gastown` works iff `gastown` is in the local registry. Adds a small lookup step before the existing URL flow. Optionally adds `gc registry config add/remove/list` sub-verbs if hand-editing `~/.gc/registry-config.toml` is friction.
+**Phase 1.5:** Two additions in v1.5:
 
-**Phase 2:** Implicit standard library — `nostdlib = true` in `pack.toml` opts out; otherwise the resolver injects a curated set of packs. Pairs with the registry-stdlib content design. **Owned by Donna, Chris, and Julian as a product-shape decision**, not by either tool's implementer.
+1. **Bare-name resolution in `gc import add`** (explicit-only mode). `gc import add gastown` works iff `gastown` is in the local registry. Adds a small lookup step before the existing URL flow.
+2. **`gc registry config add/remove/list` verbs** for managing additional internal/team registries. Promotes the v1 single-registry experience to a real multi-registry one with verb-managed configuration. v1.5 adds the user-facing API for adding/removing registries beyond the canonical default.
+
+**Phase 2:** Promote the implicit-imports list from "hardcoded in `gc-import` source" (where v1 ships it) to "registry-published `implicit.toml` from the canonical registry." Lets the implicit list grow beyond the v1 single entry (`maintenance`) without requiring a new `gc-import` release for each addition. Pairs with the canonical-registry content design — what's actually in the list is **owned by Donna, Chris, and Julian as a product-shape decision**, not by either tool's implementer.
 
 **Phase 3:** Curated internet registry tooling (`gc registry publish`, signed indices, server-side search), if there's demand.
 
@@ -408,7 +503,7 @@ The local registry shape: `~/.gc/cache/repos/<hash>/` (clones, existing path) + 
 
 These are the questions the design hasn't closed. Each one needs a decision before v1 of `gc registry` ships.
 
-1. **What's actually in the gascity-stdlib internet registry on day one?** Pack, Registry, and some combination of gastown/maintenance/dog are the obvious candidates. Decision lives in the registry-stdlib project, not here. **File an issue against the gascity-stdlib repo when v1 is closer to shipping.**
+1. **What's actually in the canonical registry on day one?** Pack, Registry, and some combination of gastown/maintenance/dog are the obvious candidates. Decision lives in the canonical registry repo, not here. **File an issue against `gastownhall/gc-registry-canonical` (or wherever the canonical registry ends up) when v1 is closer to shipping.** Also: confirm the final name and location of the canonical registry repo before v1 ships — the working name in this doc is `gastownhall/gc-registry-canonical`, but that's not committed.
 2. **Reverse-reference tracking for `gc registry remove`.** To know whether a registry version is "in use," we need to find every city on the machine that has that (URL, commit) in its `pack.lock`. Two implementations:
    - Walk every directory the user has registered as a city via `gc register` (we already track these in `~/.gc/cities.toml`) at remove time. Reasonably accurate, slow only if there are many cities, no new state to maintain.
    - Keep a back-reference index in the registry: `<city path>` for every `(name, version)` it locks. Requires `gc import` to update the registry on `install`/`upgrade`/`remove`. Faster but couples the two more tightly.
@@ -428,7 +523,8 @@ These aren't open questions — they're settled, but they're decisions worth bei
 ## Alternatives considered (and rejected)
 
 - **Local registry as a DB instead of TOML + filesystem.** Faster for large catalogs, but adds a binary format dependency and breaks "it's just files." For a registry of dozens or hundreds of packs, TOML + filesystem is fine.
-- **Internet registry as a single canonical service (like npm).** Centralization is exactly what URL-as-identity was meant to avoid. Multiple parallel registries (each a TOML file at a URL) is the right shape.
+- **Internet registry as a single canonical service (like npm).** Centralization is exactly what URL-as-identity was meant to avoid. Multiple parallel registries (each a TOML file at a URL) is the right shape *as a mechanism*. **Update:** the v1 *user-facing experience* is single-registry (canonical registry only, no way to add others) — see the canonical-registry section above. Chris Sells argued for going further and removing the multi-registry mechanism entirely; we kept the mechanism in code so v1.5 can add `gc registry config` verbs as a purely additive feature.
+- **Removing the multi-registry mechanism entirely (Chris Sells's proposal).** Chris's case: a single canonical PR-managed registry gives us curation, operational simplicity, and "one place to find packs" — everything good about npm/PyPI/crates.io minus the central-authority pain that comes from those being implementations rather than git repos. The pushback: it makes private/internal registries impossible without forking the design, which matters because Gas City is going to live a lot of its life inside organizations with internal packs. The compromise we landed on: ship the canonical registry as the only default (capturing all of Chris's wins for the common case) but keep the multi-registry code path so that private registries are a documentation change later, not a redesign. ~10 lines of "iterate over a list of one" buys us forward flexibility for free.
 - **JSON for the wire format.** Conventional for web APIs, but introduces a second format alongside the TOML we use everywhere else. Self-consistency wins.
 - **Implicit fallback for bare-name `gc import add`.** If `gastown` isn't in the local registry, query configured internet registries to resolve the name to a URL, then proceed. Quietly couples builds to internet-registry availability for the *initial* `add`, and creates a new failure mode that's hard to debug (`why did this command hit the network?`). Rejected in favor of explicit-only resolution in v1.5.
 - **Treating cities as registries.** Briefly considered — what if a city *is* a registry, and importing a pack just means "add a reference to the registry's view of it"? Rejected because cities are consumers, not catalogs. The registry concept is meant to *be* a catalog; conflating the two is the same error as taps were.
